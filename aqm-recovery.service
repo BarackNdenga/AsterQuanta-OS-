@@ -1,0 +1,12 @@
+[Unit]
+Description=AsterQuanta OS - snapshot automatique au demarrage
+After=data.mount
+Requires=data.mount
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/aqm-recovery snapshot boot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
