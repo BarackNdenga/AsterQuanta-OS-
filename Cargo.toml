@@ -1,10 +1,16 @@
 [package]
-name = "aqm-shell"
+name = "aqm-supervisor"
 version = "0.1.0"
 edition = "2021"
 
+# Volontairement sans dependances externes (std uniquement) pour un
+# build Yocto simple et robuste en v1: on interroge systemd via la
+# commande `systemctl show`, deja presente sur toute image systemd.
+# v2 possible: bascule vers zbus (D-Bus natif) sans changer l'API
+# publique du socket aqm-supervisor.
+
 [[bin]]
-name = "aqmctl"
+name = "aqm-supervisor"
 path = "src/main.rs"
 
 [profile.release]
