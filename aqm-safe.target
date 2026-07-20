@@ -1,0 +1,6 @@
+[Unit]
+Description=AsterQuanta OS - mode sur (services critiques uniquement, sans GUI)
+Requires=multi-user.target
+Conflicts=aqm-ui.service
+After=multi-user.target
+AllowIsolate=yes
