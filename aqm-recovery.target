@@ -1,0 +1,6 @@
+[Unit]
+Description=AsterQuanta OS - cible de recovery (boot minimal texte)
+Requires=basic.target
+Conflicts=graphical.target
+After=basic.target
+AllowIsolate=yes
