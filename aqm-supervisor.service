@@ -1,0 +1,15 @@
+[Unit]
+Description=AsterQuanta OS - supervision des services et score de sante
+After=multi-user.target dbus.service
+Requires=dbus.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/aqm-supervisor
+Restart=always
+RestartSec=2
+RuntimeDirectory=aqm
+User=aqm-service
+
+[Install]
+WantedBy=multi-user.target
