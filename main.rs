@@ -1,101 +1,126 @@
-// aqmctl : CLI d'administration reelle d'AsterQuanta OS.
-// Pilote de vrais outils systeme (systemctl, journalctl, rauc, aqm-dtnd)
-// - aucune simulation, ce sont de vrais appels sur le systeme installe.
+// aqm-supervisor : supervise les VRAIS services systemd de l'image
+// (pas une simulation) et publie un score de sante sur un socket UNIX
+// que aqm-shell (aqmctl) et aqm-ui consomment.
 
-use std::env;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
-use std::process::{exit, Command};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
-const SUPERVISOR_SOCKET: &str = "/run/aqm/aqm-supervisor.sock";
-const DTN_AAP_SOCKET: &str = "/run/aqm/aqm-dtnd.aap.sock";
+const SOCKET_PATH: &str = "/run/aqm/aqm-supervisor.sock";
 
-fn usage() {
-    eprintln!(
-        "aqmctl <commande>\n\n\
-         status                 Rapport de sante (via aqm-supervisor)\n\
-         services               Liste des services systemd surveilles\n\
-         restart <service>      systemctl restart <service>\n\
-         logs [n]                journalctl -n <n> (defaut 20)\n\
-         update install <bundle> rauc install <bundle> (update A/B reelle)\n\
-         update status           rauc status\n\
-         recovery                bascule vers aqm-recovery.target\n\
-         safe-mode on|off        bascule aqm-safe.target / multi-user.target\n\
-         dtn status              statut du noeud DTN (aqm-dtnd)\n"
-    );
+const CRITICAL_SERVICES: &[&str] = &[
+    "aqm-dtnd.service",
+    "aqm-recovery.service",
+    "sshd.service",
+];
+
+const WATCHED_SERVICES: &[&str] = &[
+    "aqm-dtnd.service",
+    "aqm-recovery.service",
+    "aqm-ui.service",
+    "sshd.service",
+    "rauc.service",
+];
+
+struct ServiceState {
+    name: String,
+    active_state: String,
+    sub_state: String,
+    n_restarts: String,
 }
 
-fn read_supervisor() -> String {
-    match UnixStream::connect(SUPERVISOR_SOCKET) {
-        Ok(mut s) => {
-            let _ = s.write_all(b"status");
-            let mut buf = String::new();
-            let _ = s.read_to_string(&mut buf);
-            buf
+fn query_service(name: &str) -> ServiceState {
+    let out = Command::new("systemctl")
+        .args([
+            "show",
+            name,
+            "--property=ActiveState,SubState,NRestarts",
+            "--value",
+        ])
+        .output();
+
+    let (active, sub, restarts) = match out {
+        Ok(o) => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let mut lines = text.lines();
+            (
+                lines.next().unwrap_or("unknown").to_string(),
+                lines.next().unwrap_or("unknown").to_string(),
+                lines.next().unwrap_or("0").to_string(),
+            )
         }
-        Err(e) => format!("{{\"error\":\"aqm-supervisor injoignable: {}\"}}", e),
+        Err(_) => ("unreachable".into(), "unreachable".into(), "0".into()),
+    };
+
+    ServiceState {
+        name: name.to_string(),
+        active_state: active,
+        sub_state: sub,
+        n_restarts: restarts,
     }
 }
 
-fn run(cmd: &str, args: &[&str]) {
-    match Command::new(cmd).args(args).status() {
-        Ok(s) if s.success() => {}
-        Ok(s) => exit(s.code().unwrap_or(1)),
-        Err(e) => {
-            eprintln!("erreur d'execution de {}: {}", cmd, e);
-            exit(1);
+fn health_report() -> String {
+    let mut healthy = 0usize;
+    let mut critical_down = false;
+    let mut lines = Vec::new();
+
+    for &svc in WATCHED_SERVICES {
+        let s = query_service(svc);
+        let ok = s.active_state == "active";
+        if ok {
+            healthy += 1;
         }
+        if CRITICAL_SERVICES.contains(&svc) && !ok {
+            critical_down = true;
+        }
+        lines.push(format!(
+            "{{\"service\":\"{}\",\"active_state\":\"{}\",\"sub_state\":\"{}\",\"restarts\":{}}}",
+            s.name, s.active_state, s.sub_state, s.n_restarts
+        ));
     }
+
+    let score = healthy as f32 / WATCHED_SERVICES.len() as f32;
+    let system_state = if critical_down {
+        "critical"
+    } else if score < 1.0 {
+        "degraded"
+    } else {
+        "nominal"
+    };
+
+    format!(
+        "{{\"score\":{:.2},\"system_state\":\"{}\",\"services\":[{}]}}\n",
+        score,
+        system_state,
+        lines.join(",")
+    )
+}
+
+fn handle_client(mut stream: UnixStream) {
+    let mut buf = [0u8; 64];
+    let _ = stream.read(&mut buf);
+    let report = health_report();
+    let _ = stream.write_all(report.as_bytes());
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        usage();
-        exit(1);
-    }
+    std::fs::create_dir_all("/run/aqm").ok();
+    let _ = std::fs::remove_file(SOCKET_PATH);
+    let listener = UnixListener::bind(SOCKET_PATH).expect("bind aqm-supervisor socket");
 
-    match args[1].as_str() {
-        "status" => println!("{}", read_supervisor().trim()),
-        "services" => run("systemctl", &["list-units", "aqm-*.service", "rauc.service", "--no-pager"]),
-        "restart" => {
-            if args.len() < 3 {
-                eprintln!("Usage: aqmctl restart <service>");
-                exit(1);
-            }
-            run("systemctl", &["restart", &args[2]]);
-        }
-        "logs" => {
-            let n = args.get(2).map(|s| s.as_str()).unwrap_or("20");
-            run("journalctl", &["-n", n, "--no-pager"]);
-        }
-        "update" => match args.get(2).map(|s| s.as_str()) {
-            Some("install") => {
-                let Some(bundle) = args.get(3) else {
-                    eprintln!("Usage: aqmctl update install <bundle.raucb>");
-                    exit(1);
-                };
-                run("rauc", &["install", bundle]);
-            }
-            Some("status") => run("rauc", &["status"]),
-            _ => usage(),
-        },
-        "recovery" => run("systemctl", &["isolate", "aqm-recovery.target"]),
-        "safe-mode" => match args.get(2).map(|s| s.as_str()) {
-            Some("on") => run("systemctl", &["isolate", "aqm-safe.target"]),
-            Some("off") => run("systemctl", &["isolate", "multi-user.target"]),
-            _ => usage(),
-        },
-        "dtn" => match args.get(2).map(|s| s.as_str()) {
-            Some("status") => match UnixStream::connect(DTN_AAP_SOCKET) {
-                Ok(_) => println!("aqm-dtnd: socket AAP joignable ({})", DTN_AAP_SOCKET),
-                Err(e) => println!("aqm-dtnd injoignable: {}", e),
-            },
-            _ => usage(),
-        },
-        _ => {
-            usage();
-            exit(1);
+    // Boucle de fond: journalise l'etat toutes les 30s (visible via
+    // `journalctl -u aqm-supervisor`), en plus de servir les requetes.
+    thread::spawn(|| loop {
+        println!("health_report {}", health_report().trim());
+        thread::sleep(Duration::from_secs(30));
+    });
+
+    for stream in listener.incoming() {
+        if let Ok(stream) = stream {
+            handle_client(stream);
         }
     }
 }
